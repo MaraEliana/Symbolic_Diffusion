@@ -1,15 +1,16 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 import math
 import time
 import random
 import sys
 import os
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import matplotlib.pyplot as plt
 from IPython import display
 
@@ -58,7 +59,7 @@ class DiscreteDiffusion:
             raise ValueError(f"Unknown schedule type: {SCHEDULE_TYPE}")
 
         self.alphas = (1. - self.betas).to(device)
-        self.alphas_cumprod = torch.cumprod(self.alphas, axis=0).to(device)
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0).to(device)
         self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0).to(device)
 
         self.log_q_t_x_t_minus_1 = self._compute_log_q_t_x_t_minus_1()
@@ -235,8 +236,6 @@ class DiscreteDiffusion:
         return x_t
 
 
-    
-
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
@@ -247,6 +246,7 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0).transpose(0, 1)
+        self.pe: torch.Tensor
         self.register_buffer('pe', pe)
     def forward(self, x):
         x = x + self.pe[:x.size(0), :]
@@ -406,28 +406,67 @@ class SymbolicRegressionDataset(Dataset):
         self.data = data
         self.x_means, self.x_stds = x_means, x_stds
         self.y_mean, self.y_std = y_mean, y_std
-        self.processed_data = []
-        for item in data:
-             token_ids = np.array(item['token_ids'], dtype=np.int64)
-             if np.any(token_ids >= VOCAB_SIZE):
-                 token_ids = np.clip(token_ids, 0, VOCAB_SIZE - 1)
-
-             xy_coords = np.array(item['X_Y_combined'], dtype=np.float32)
-             xy_coords[:, :-1] = (xy_coords[:, :-1] - self.x_means) / (self.x_stds + 1e-8)
-             xy_coords[:, -1] = (xy_coords[:, -1] - self.y_mean) / (self.y_std + 1e-8)
-
-             condition_tensor = torch.from_numpy(xy_coords)
-
-             self.processed_data.append({
-                 'token_ids': torch.from_numpy(token_ids),
-                 'condition': condition_tensor
-             })
 
     def __len__(self):
-        return len(self.processed_data)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        return self.processed_data[idx]
+        item = self.data[idx]
+        token_ids = np.array(item['token_ids'], dtype=np.int64)
+        if token_ids.size == 0:
+            token_ids = np.array([PAD_TOKEN_ID], dtype=np.int64)
+        if np.any(token_ids >= VOCAB_SIZE):
+            token_ids = np.clip(token_ids, 0, VOCAB_SIZE - 1)
+
+        xy_coords = np.array(item['X_Y_combined'], dtype=np.float32)
+        xy_coords[:, :-1] = (xy_coords[:, :-1] - self.x_means) / (self.x_stds + 1e-8)
+        xy_coords[:, -1] = (xy_coords[:, -1] - self.y_mean) / (self.y_std + 1e-8)
+
+        condition_tensor = torch.from_numpy(xy_coords)
+
+        return {
+            'token_ids': torch.from_numpy(token_ids),
+            'condition': condition_tensor
+        }
+
+
+def dynamic_pad_collate(batch):
+    if not batch:
+        raise ValueError("Received empty batch in collate_fn")
+
+    token_tensors = []
+    condition_tensors = []
+    max_seq_len = 0
+
+    for item in batch:
+        token_ids = item['token_ids']
+        if not isinstance(token_ids, torch.Tensor):
+            token_ids = torch.as_tensor(token_ids, dtype=torch.long)
+        else:
+            token_ids = token_ids.to(dtype=torch.long)
+
+        if token_ids.numel() == 0:
+            token_ids = torch.tensor([PAD_TOKEN_ID], dtype=torch.long)
+
+        token_tensors.append(token_ids)
+        max_seq_len = max(max_seq_len, token_ids.shape[0])
+
+        condition = item['condition']
+        if not isinstance(condition, torch.Tensor):
+            condition = torch.as_tensor(condition, dtype=torch.float32)
+        condition_tensors.append(condition)
+
+    padded_tokens = torch.full((len(batch), max_seq_len), PAD_TOKEN_ID, dtype=torch.long)
+    for i, token_ids in enumerate(token_tensors):
+        seq_len = token_ids.shape[0]
+        padded_tokens[i, :seq_len] = token_ids
+
+    conditions = torch.stack(condition_tensors, dim=0)
+
+    return {
+        'token_ids': padded_tokens,
+        'condition': conditions,
+    }
 
 
 @torch.no_grad()
@@ -455,7 +494,7 @@ def evaluate(model, diffusion, val_loader, device):
 
 
 
-def train(train_data, test_data):
+def train(train_data, test_data, x_means=None, x_stds=None, y_mean=None, y_std=None):
     print(f"Using device: {DEVICE}")
     print(f"Training data size: {len(train_data)}")
     print(f"Validation (test) data size: {len(test_data)}")
@@ -466,28 +505,38 @@ def train(train_data, test_data):
     if not perform_validation:
         print("Warning: test_data is empty. Skipping validation.")
 
-    print("Calculating per-dimension normalization statistics from train_data...")
-    all_coords_list = [item['X_Y_combined'] for item in train_data]
-    if not all_coords_list:
-        raise ValueError("train_data is empty, cannot calculate normalization stats.")
-    all_coords_np = np.array(all_coords_list, dtype=np.float32)
-    all_coords_np = np.nan_to_num(all_coords_np, nan=0.0, posinf=0.0, neginf=0.0)
+    # If normalization stats not provided, compute from a sample
+    if x_means is None or x_stds is None or y_mean is None or y_std is None:
+        print("Calculating per-dimension normalization statistics from train_data sample...")
+        all_coords_list = []
+        sample_size = min(1000, len(train_data))
+        indices = np.random.choice(len(train_data), size=sample_size, replace=False)
+        
+        for idx in indices:
+            item = train_data[idx]
+            if 'X_Y_combined' in item:
+                all_coords_list.append(item['X_Y_combined'])
+        
+        if not all_coords_list:
+            raise ValueError("train_data is empty, cannot calculate normalization stats.")
+        all_coords_np = np.array(all_coords_list, dtype=np.float32)
+        all_coords_np = np.nan_to_num(all_coords_np, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Separate X features (all columns except last) and Y feature (last column)
-    all_x_features = all_coords_np[:, :, :-1] # Shape: (N_records, N_POINTS, D)
-    all_y_features = all_coords_np[:, :, -1]  # Shape: (N_records, N_POINTS)
+        # Separate X features (all columns except last) and Y feature (last column)
+        all_x_features = all_coords_np[:, :, :-1] # Shape: (N_records, N_POINTS, D)
+        all_y_features = all_coords_np[:, :, -1]  # Shape: (N_records, N_POINTS)
 
-    # Calculate mean/std PER X DIMENSION (axis=(0, 1) averages over records and points)
-    x_means = np.mean(all_x_features, axis=(0, 1)) # Shape: (D,)
-    x_stds = np.std(all_x_features, axis=(0, 1))   # Shape: (D,)
+        # Calculate mean/std PER X DIMENSION (axis=(0, 1) averages over records and points)
+        x_means = np.mean(all_x_features, axis=(0, 1)) # Shape: (D,)
+        x_stds = np.std(all_x_features, axis=(0, 1))   # Shape: (D,)
 
-    # Calculate mean/std for Y dimension (axis=(0, 1) averages over records and points)
-    y_mean = np.mean(all_y_features) # Scalar
-    y_std = np.std(all_y_features)   # Scalar
+        # Calculate mean/std for Y dimension (axis=(0, 1) averages over records and points)
+        y_mean = float(np.mean(all_y_features)) # Scalar
+        y_std = float(np.std(all_y_features))   # Scalar
 
-    # Prevent division by zero if std is too small
-    x_stds = np.where(x_stds > 1e-6, x_stds, 1.0)
-    y_std = y_std if y_std > 1e-6 else 1.0
+        # Prevent division by zero if std is too small
+        x_stds = np.where(x_stds > 1e-6, x_stds, 1.0)
+        y_std = y_std if y_std > 1e-6 else 1.0
 
     print(f"Normalization Stats:")
     for d in range(len(x_means)):
@@ -499,9 +548,23 @@ def train(train_data, test_data):
     val_loader = None
     if perform_validation:
         val_dataset = SymbolicRegressionDataset(test_data, x_means, x_stds, y_mean, y_std)
-        val_loader = DataLoader(val_dataset, batch_size=VALIDATION_BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True if DEVICE == "cuda" else False)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=VALIDATION_BATCH_SIZE,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True if DEVICE == "cuda" else False,
+            collate_fn=dynamic_pad_collate,
+        )
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True if DEVICE == "cuda" else False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=True if DEVICE == "cuda" else False,
+        collate_fn=dynamic_pad_collate,
+    )
 
     model = ConditionalD3PMTransformer(
         vocab_size=VOCAB_SIZE, embed_dim=EMBED_DIM, num_heads=NUM_HEADS, num_layers=NUM_LAYERS,
@@ -512,7 +575,7 @@ def train(train_data, test_data):
 
     diffusion = DiscreteDiffusion(num_timesteps=NUM_TIMESTEPS, vocab_size=VOCAB_SIZE, device=DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     if perform_validation:
@@ -523,7 +586,7 @@ def train(train_data, test_data):
     epochs_plotted = []; train_losses = []; val_losses = []
 
     # --- Training Loop ---
-    for epoch in range(EPOCHS):
+    for epoch in tqdm(range(EPOCHS)):
         model.train()
         total_train_loss = 0.0
         start_time = time.time()
