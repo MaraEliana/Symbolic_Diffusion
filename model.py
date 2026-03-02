@@ -239,17 +239,28 @@ class DiscreteDiffusion:
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
+        self.d_model = d_model
         self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        self.register_buffer('pe', self._build_pe(max_len))
+
+    def _build_pe(self, max_len):
+        pe = torch.zeros(max_len, self.d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / self.d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.pe: torch.Tensor
-        self.register_buffer('pe', pe)
+        return pe.unsqueeze(0)
+
+    def _ensure_length(self, seq_len, device):
+        if seq_len <= self.pe.size(1):
+            return
+        new_len = max(seq_len, self.pe.size(1) * 2)
+        self.pe = self._build_pe(new_len).to(device)
+
     def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
+        seq_len = x.size(1)
+        self._ensure_length(seq_len, x.device)
+        x = x + self.pe[:, :seq_len, :].to(dtype=x.dtype)
         return self.dropout(x)
 
 class TimestepEmbedding(nn.Module):
@@ -369,9 +380,7 @@ class ConditionalD3PMTransformer(nn.Module):
         device = x.device
 
         token_emb = self.token_embedding(x) * math.sqrt(self.embed_dim)
-        token_emb_permuted = token_emb.transpose(0, 1)
-        pos_emb_permuted = self.positional_encoding(token_emb_permuted)
-        pos_emb = pos_emb_permuted.transpose(0, 1)
+        pos_emb = self.positional_encoding(token_emb)
         time_emb = self.timestep_embedding(t)
         time_emb = time_emb.unsqueeze(1).expand(-1, seq_len, -1)
 
@@ -404,7 +413,8 @@ class ConditionalD3PMTransformer(nn.Module):
 class SymbolicRegressionDataset(Dataset):
     def __init__(self, data, x_means, x_stds, y_mean=0.0, y_std=1.0):
         self.data = data
-        self.x_means, self.x_stds = x_means, x_stds
+        self.x_means = np.asarray(x_means, dtype=np.float32)
+        self.x_stds = np.asarray(x_stds, dtype=np.float32)
         self.y_mean, self.y_std = y_mean, y_std
 
     def __len__(self):
@@ -496,6 +506,8 @@ def evaluate(model, diffusion, val_loader, device):
 
 def train(train_data, test_data, x_means=None, x_stds=None, y_mean=None, y_std=None):
     print(f"Using device: {DEVICE}")
+    if DEVICE == "cuda":
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
     print(f"Training data size: {len(train_data)}")
     print(f"Validation (test) data size: {len(test_data)}")
 
@@ -545,25 +557,47 @@ def train(train_data, test_data, x_means=None, x_stds=None, y_mean=None, y_std=N
 
     # Create Datasets (Pass the calculated stats - now x_means/x_stds are arrays)
     train_dataset = SymbolicRegressionDataset(train_data, x_means, x_stds, y_mean, y_std)
+
+    is_lazy_dataset = hasattr(train_data, "lazy_dataset")
+    train_num_workers_default = 2 if is_lazy_dataset else 0
+    val_num_workers_default = 2 if (is_lazy_dataset and perform_validation) else 0
+    train_num_workers = int(os.getenv("TRAIN_NUM_WORKERS", str(train_num_workers_default)))
+    val_num_workers = int(os.getenv("VAL_NUM_WORKERS", str(val_num_workers_default)))
+    train_shuffle = os.getenv("TRAIN_SHUFFLE", "0" if is_lazy_dataset else "1") == "1"
+    print(f"DataLoader settings: train_shuffle={train_shuffle}, train_num_workers={train_num_workers}, val_num_workers={val_num_workers}")
+
     val_loader = None
     if perform_validation:
         val_dataset = SymbolicRegressionDataset(test_data, x_means, x_stds, y_mean, y_std)
+        val_loader_kwargs = {
+            "dataset": val_dataset,
+            "batch_size": VALIDATION_BATCH_SIZE,
+            "shuffle": False,
+            "num_workers": val_num_workers,
+            "pin_memory": True if DEVICE == "cuda" else False,
+            "collate_fn": dynamic_pad_collate,
+        }
+        if val_num_workers > 0:
+            val_loader_kwargs["persistent_workers"] = True
+            val_loader_kwargs["prefetch_factor"] = 2
         val_loader = DataLoader(
-            val_dataset,
-            batch_size=VALIDATION_BATCH_SIZE,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True if DEVICE == "cuda" else False,
-            collate_fn=dynamic_pad_collate,
+            **val_loader_kwargs,
         )
 
+    train_loader_kwargs = {
+        "dataset": train_dataset,
+        "batch_size": BATCH_SIZE,
+        "shuffle": train_shuffle,
+        "num_workers": train_num_workers,
+        "pin_memory": True if DEVICE == "cuda" else False,
+        "collate_fn": dynamic_pad_collate,
+    }
+    if train_num_workers > 0:
+        train_loader_kwargs["persistent_workers"] = True
+        train_loader_kwargs["prefetch_factor"] = 2
+
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=True if DEVICE == "cuda" else False,
-        collate_fn=dynamic_pad_collate,
+        **train_loader_kwargs,
     )
 
     model = ConditionalD3PMTransformer(
@@ -586,13 +620,19 @@ def train(train_data, test_data, x_means=None, x_stds=None, y_mean=None, y_std=N
     epochs_plotted = []; train_losses = []; val_losses = []
 
     # --- Training Loop ---
-    for epoch in tqdm(range(EPOCHS)):
+    outer_bar = tqdm(range(EPOCHS), desc = "Progress over epochs")
+    for epoch in outer_bar:
         model.train()
         total_train_loss = 0.0
         start_time = time.time()
         processed_batches = 0
 
-        for i, batch in enumerate(train_loader):
+        print(f"Epoch [{epoch+1}/{EPOCHS}] waiting for first train batch...")
+        first_batch_wait_start = time.time()
+        inner_bar = tqdm(enumerate(train_loader), desc="Progress over dataset")
+        for i, batch in inner_bar:
+            if i == 0:
+                print(f"First batch ready after {time.time() - first_batch_wait_start:.2f}s")
             optimizer.zero_grad()
             x_start = batch['token_ids'].to(DEVICE)
             condition = batch['condition'].to(DEVICE) # Shape (B, N_POINTS, CONDITION_FEATURE_DIM)

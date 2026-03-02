@@ -150,7 +150,7 @@ class LazyLoadingDataset:
             self._cumulative_rows.append(total_rows)
 
         self._cached_row_group_key = None
-        self._cached_row_group_df = None
+        self._cached_row_group_table = None
         print(f"Found {total_rows} total records")
 
     def __len__(self):
@@ -177,11 +177,16 @@ class LazyLoadingDataset:
         if self._cached_row_group_key != cache_key:
             parquet_file = file_info["parquet"]
             table = parquet_file.read_row_group(row_group_idx, columns=["skeleton", "X", "Y"])
-            self._cached_row_group_df = table.to_pandas()
+            self._cached_row_group_table = table
             self._cached_row_group_key = cache_key
 
-        assert self._cached_row_group_df is not None, "Row group data should be cached at this point"
-        return self._cached_row_group_df.iloc[row_in_group].to_dict()
+        assert self._cached_row_group_table is not None, "Row group data should be cached at this point"
+        row = self._cached_row_group_table.slice(row_in_group, 1)
+        return {
+            "skeleton": row.column("skeleton")[0].as_py(),
+            "X": row.column("X")[0].as_py(),
+            "Y": row.column("Y")[0].as_py(),
+        }
 
 
 class PreprocessedLazyDataset:
@@ -209,9 +214,15 @@ def compute_normalization_stats(dataset, sample_size=None):
     if len(dataset) == 0:
         raise ValueError("Dataset is empty; cannot compute normalization statistics")
 
-    if sample_size is not None:
-        print("sample_size is ignored to compute exact full-dataset normalization statistics.")
-    print(f"Computing normalization stats over full dataset ({len(dataset)} records)...")
+    if sample_size is not None and sample_size > 0:
+        sample_size = min(int(sample_size), len(dataset))
+        rng = np.random.default_rng(42)
+        sampled_indices = np.sort(rng.choice(len(dataset), size=sample_size, replace=False))
+        indices_to_process = sampled_indices.tolist()
+        print(f"Computing normalization stats over sample ({sample_size}/{len(dataset)} records)...")
+    else:
+        indices_to_process = list(range(len(dataset)))
+        print(f"Computing normalization stats over full dataset ({len(dataset)} records)...")
 
     x_sum = None
     x_sum_sq = None
@@ -220,9 +231,9 @@ def compute_normalization_stats(dataset, sample_size=None):
     total_points = 0
     valid_records = 0
 
-    for idx in tqdm(range(len(dataset))):
-        if (idx + 1) % 1000 == 0:
-            print(f"  Processed {idx + 1}/{len(dataset)} records")
+    for processed_count, idx in enumerate(tqdm(indices_to_process), start=1):
+        if processed_count % 1000 == 0:
+            print(f"  Processed {processed_count}/{len(indices_to_process)} records")
 
 
         processed_item = preprocess_record(dataset[idx])
@@ -309,8 +320,10 @@ if __name__ == "__main__":
 
     max_train_files_env = os.getenv("MAX_TRAIN_FILES")
     max_val_files_env = os.getenv("MAX_VAL_FILES")
+    norm_sample_size_env = os.getenv("NORM_SAMPLE_SIZE")
     max_train_files = int(max_train_files_env) if max_train_files_env else None
     max_val_files = int(max_val_files_env) if max_val_files_env else None
+    norm_sample_size = int(norm_sample_size_env) if norm_sample_size_env else 5000
 
     train_dataset, val_dataset = load_and_preprocess_dataset(
         train_pattern=train_pattern,
@@ -319,7 +332,10 @@ if __name__ == "__main__":
         max_val_files=max_val_files,
     )
 
-    x_means, x_stds, y_mean, y_std = compute_normalization_stats(train_dataset.lazy_dataset)
+    x_means, x_stds, y_mean, y_std = compute_normalization_stats(
+        train_dataset.lazy_dataset,
+        sample_size=norm_sample_size,
+    )
 
     if len(train_dataset) > 0:
         print("\nStarting training...")
