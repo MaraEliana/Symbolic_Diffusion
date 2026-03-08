@@ -14,20 +14,29 @@ VOCAB = {
     "<SOS>": 1,
     "<EOS>": 2,
     "<UNK>": 3,
-    "C": 4,
+    "*": 4,
     "+": 5,
     "-": 6,
-    "*": 7,
-    "/": 8,
-    "**": 9,
-    "sin": 10,
-    "cos": 11,
-    "exp": 12,
-    "log": 13,
-    "2": 15,
-    "3": 16,
-    "x1": 17,
-    "x2": 18,
+    "/": 7,
+    "0": 8,
+    "1": 9,
+    "2": 10,
+    "3": 11,
+    "4": 12,
+    "5": 13,
+    "6": 14,
+    "<constant>": 15,
+    "cos": 16,
+    "exp": 17,
+    "log": 18,
+    "pow2": 19,
+    "pow3": 20,
+    "pow4": 21,
+    "pow5": 22,
+    "pow6": 23,
+    "sin": 24,
+    "x1": 25,
+    "x2": 26
 }
 
 
@@ -49,6 +58,7 @@ def process_equation_to_tokens(equation):
 
             if isinstance(token, str):
                 token_ids.append(VOCAB.get(token, VOCAB["<UNK>"]))
+        assert VOCAB["<UNK>"] not in token_ids, f"Warning: Found unknown token(s) in equation: {equation}"
 
         return np.array(token_ids, dtype=np.int64)
 
@@ -315,8 +325,8 @@ def load_and_preprocess_dataset(train_pattern, val_pattern=None, max_train_files
 
 
 if __name__ == "__main__":
-    train_pattern = os.getenv("TRAIN_PATTERN", "data/Train/*.parquet")
-    val_pattern = os.getenv("VAL_PATTERN", "data/Val/*.parquet")
+    train_pattern = os.getenv("TRAIN_PATTERN", "data/preprocessed_parquet/Train/*.parquet")
+    val_pattern = os.getenv("VAL_PATTERN", "data/preprocessed_parquet/Val/*.parquet")
 
     max_train_files_env = os.getenv("MAX_TRAIN_FILES")
     max_val_files_env = os.getenv("MAX_VAL_FILES")
